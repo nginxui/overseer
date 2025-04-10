@@ -155,6 +155,28 @@ func main() {
 * Currently shells out to `mv` for moving files because `mv` handles cross-partition moves unlike `os.Rename`.
 * Package `init()` functions will run twice on start, once in the main process and once in the child process.
 
+## Windows Named Pipe Communication
+
+On Windows platform, since UNIX domain sockets and file descriptor passing mechanisms are not supported, Overseer uses Windows named pipes to implement communication between the main process and child processes.
+
+### Architecture Design
+
+1. **Main Process**:
+   - Creates a unique named pipe for each listening address
+   - Passes all pipe names as environment variables to the child process
+   - Accepts pipe connections from the child process, and creates dedicated data transfer channels for each address
+
+2. **Child Process**:
+   - Gets all pipe names and counts from environment variables
+   - Connects to corresponding dedicated pipes for each address
+   - Creates virtual listeners for each address, handling connections transparently
+
+3. **Connection Flow**:
+   - Client connects to the main process's TCP listener
+   - Main process directly forwards TCP connections to the dedicated pipe for the corresponding address
+   - Child process receives data from the pipe and processes the request
+   - No control information exchange is needed, data transmission is direct
+
 ### More documentation
 
 * [Core `overseer` package](https://godoc.org/github.com/jpillora/overseer)

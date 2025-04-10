@@ -1,8 +1,7 @@
 package overseer
 
-//overseer listeners and connections allow graceful
-//restarts by tracking when all connections from a listener
-//have been closed
+// overseer listeners and connections allow graceful restarts by tracking when all connections
+// from a listener have been closed
 
 import (
 	"net"
@@ -18,7 +17,7 @@ func newOverseerListener(l net.Listener) *overseerListener {
 	}
 }
 
-//gracefully closing net.Listener
+// gracefully closing net.Listener
 type overseerListener struct {
 	net.Listener
 	closeError   error
@@ -27,12 +26,26 @@ type overseerListener struct {
 }
 
 func (l *overseerListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.(*net.TCPListener).AcceptTCP()
-	if err != nil {
-		return nil, err
+	var conn net.Conn
+
+	// Try to convert the listener to TCPListener for better connection control
+	if tcpL, ok := l.Listener.(*net.TCPListener); ok {
+		tcpConn, tcpErr := tcpL.AcceptTCP()
+		if tcpErr != nil {
+			return nil, tcpErr
+		}
+		tcpConn.SetKeepAlive(true)                  // see http.tcpKeepAliveListener
+		tcpConn.SetKeepAlivePeriod(3 * time.Minute) // see http.tcpKeepAliveListener
+		conn = tcpConn
+	} else {
+		// For non-TCP listeners, use standard Accept
+		standardConn, standardErr := l.Listener.Accept()
+		if standardErr != nil {
+			return nil, standardErr
+		}
+		conn = standardConn
 	}
-	conn.SetKeepAlive(true)                  // see http.tcpKeepAliveListener
-	conn.SetKeepAlivePeriod(3 * time.Minute) // see http.tcpKeepAliveListener
+
 	uconn := overseerConn{
 		Conn:   conn,
 		wg:     &l.wg,
@@ -44,18 +57,18 @@ func (l *overseerListener) Accept() (net.Conn, error) {
 		case <-l.closeByForce:
 			uconn.Close()
 		case <-uconn.closed:
-			//closed manually
+			// closed manually
 		}
 	}()
 	l.wg.Add(1)
 	return uconn, nil
 }
 
-//non-blocking trigger close
+// non-blocking trigger close
 func (l *overseerListener) release(timeout time.Duration) {
-	//stop accepting connections - release fd
+	// stop accepting connections - release fd
 	l.closeError = l.Listener.Close()
-	//start timer, close by force if deadline not met
+	// start timer, close by force if deadline not met
 	waited := make(chan bool)
 	go func() {
 		l.wg.Wait()
@@ -71,7 +84,7 @@ func (l *overseerListener) release(timeout time.Duration) {
 	}()
 }
 
-//blocking wait for close
+// Close after blocking wait
 func (l *overseerListener) Close() error {
 	l.wg.Wait()
 	return l.closeError
@@ -79,12 +92,17 @@ func (l *overseerListener) Close() error {
 
 func (l *overseerListener) File() *os.File {
 	// returns a dup(2) - FD_CLOEXEC flag *not* set
-	tl := l.Listener.(*net.TCPListener)
-	fl, _ := tl.File()
-	return fl
+	if tcpL, ok := l.Listener.(*net.TCPListener); ok {
+		fl, _ := tcpL.File()
+		return fl
+	}
+
+	// For non-TCP listeners, return nil
+	// This is safe because Windows version doesn't use ExtraFiles feature
+	return nil
 }
 
-//notifying on close net.Conn
+// notifying on close net.Conn
 type overseerConn struct {
 	net.Conn
 	wg     *sync.WaitGroup

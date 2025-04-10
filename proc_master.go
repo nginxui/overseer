@@ -5,16 +5,15 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -22,7 +21,7 @@ import (
 
 var tmpBinPath = filepath.Join(os.TempDir(), "overseer-"+token()+extension())
 
-//a overseer master process
+// an overseer master process
 type master struct {
 	*Config
 	slaveID             int
@@ -39,6 +38,8 @@ type master struct {
 	descriptorsReleased chan bool
 	signalledAt         time.Time
 	printCheckUpdate    bool
+	pipeNames           []string // Windows pipe names array (one pipe per address)
+	pipeCancel          func()   // Function to cancel named pipe listening
 }
 
 func (mp *master) run() error {
@@ -53,7 +54,7 @@ func (mp *master) run() error {
 		}
 	}
 	mp.setupSignalling()
-	if err := mp.retreiveFileDescriptors(); err != nil {
+	if err := mp.retrieveFileDescriptors(); err != nil {
 		return err
 	}
 	if mp.Config.Fetcher != nil {
@@ -61,11 +62,19 @@ func (mp *master) run() error {
 		mp.fetch()
 		go mp.fetchLoop()
 	}
+
+	// Close named pipe when process exits
+	defer func() {
+		if mp.pipeCancel != nil {
+			mp.pipeCancel()
+		}
+	}()
+
 	return mp.forkLoop()
 }
 
 func (mp *master) checkBinary() error {
-	//get path to binary and confirm its writable
+	// get path to binary and confirm its writable
 	binPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to find binary path (%s)", err)
@@ -76,19 +85,19 @@ func (mp *master) checkBinary() error {
 	} else if info.Size() == 0 {
 		return fmt.Errorf("binary file is empty")
 	} else {
-		//copy permissions
+		// copy permissions
 		mp.binPerms = info.Mode()
 	}
 	f, err := os.Open(binPath)
 	if err != nil {
 		return fmt.Errorf("cannot read binary (%s)", err)
 	}
-	//initial hash of file
+	// initial hash of file
 	hash := sha1.New()
 	io.Copy(hash, f)
 	mp.binHash = hash.Sum(nil)
 	f.Close()
-	//test bin<->tmpbin moves
+	// test bin<->tmpbin moves
 	if mp.Config.Fetcher != nil {
 		if err := move(tmpBinPath, mp.binPath); err != nil {
 			return fmt.Errorf("cannot move binary (%s)", err)
@@ -101,10 +110,10 @@ func (mp *master) checkBinary() error {
 }
 
 func (mp *master) setupSignalling() {
-	//updater-forker comms
+	// updater-forker commands
 	mp.restarted = make(chan bool)
 	mp.descriptorsReleased = make(chan bool)
-	//read all master process signals
+	// read all master process signals
 	signals := make(chan os.Signal)
 	signal.Notify(signals)
 	go func() {
@@ -116,26 +125,23 @@ func (mp *master) setupSignalling() {
 
 func (mp *master) handleSignal(s os.Signal) {
 	if s == mp.RestartSignal {
-		//user initiated manual restart
+		// user initiated manual restart
 		go mp.triggerRestart()
 	} else if s.String() == "child exited" {
 		// will occur on every restart, ignore it
 	} else
-	//**during a restart** a SIGUSR1 signals
-	//to the master process that, the file
-	//descriptors have been released
+	// **during a restart** a SIGUSR1 signals to the master process that, the file descriptors have been released
 	if mp.awaitingUSR1 && s == SIGUSR1 {
 		mp.debugf("signaled, sockets ready")
 		mp.awaitingUSR1 = false
 		mp.descriptorsReleased <- true
 	} else
-	//while the slave process is running, proxy
-	//all signals through
+	// while the slave process is running, proxy all signals through
 	if mp.slaveCmd != nil && mp.slaveCmd.Process != nil {
 		mp.debugf("proxy signal (%s)", s)
 		mp.sendSignal(s)
 	} else
-	//otherwise if not running, kill on CTRL+c
+	// otherwise if not running, kill on CTRL+c
 	if s == os.Interrupt {
 		mp.debugf("interupt with no slave")
 		os.Exit(1)
@@ -153,30 +159,7 @@ func (mp *master) sendSignal(s os.Signal) {
 	}
 }
 
-func (mp *master) retreiveFileDescriptors() error {
-	mp.slaveExtraFiles = make([]*os.File, len(mp.Config.Addresses))
-	for i, addr := range mp.Config.Addresses {
-		a, err := net.ResolveTCPAddr("tcp", addr)
-		if err != nil {
-			return fmt.Errorf("Invalid address %s (%s)", addr, err)
-		}
-		l, err := net.ListenTCP("tcp", a)
-		if err != nil {
-			return err
-		}
-		f, err := l.File()
-		if err != nil {
-			return fmt.Errorf("Failed to retreive fd for: %s (%s)", addr, err)
-		}
-		if err := l.Close(); err != nil {
-			return fmt.Errorf("Failed to close listener for: %s (%s)", addr, err)
-		}
-		mp.slaveExtraFiles[i] = f
-	}
-	return nil
-}
-
-//fetchLoop is run in a goroutine
+// fetchLoop is run in a goroutine
 func (mp *master) fetchLoop() {
 	min := mp.Config.MinFetchInterval
 	time.Sleep(min)
@@ -310,30 +293,30 @@ func (mp *master) fetch() {
 func (mp *master) triggerRestart() {
 	if mp.restarting {
 		mp.debugf("already graceful restarting")
-		return //skip
+		return // skip
 	} else if mp.slaveCmd == nil || mp.restarting {
 		mp.debugf("no slave process")
-		return //skip
+		return // skip
 	}
 	mp.debugf("graceful restart triggered")
 	mp.restarting = true
 	mp.awaitingUSR1 = true
 	mp.signalledAt = time.Now()
-	mp.sendSignal(mp.Config.RestartSignal) //ask nicely to terminate
+	mp.sendSignal(mp.Config.RestartSignal) // ask nicely to terminate
 	select {
 	case <-mp.restarted:
-		//success
+		// success
 		mp.debugf("restart success")
 	case <-time.After(mp.TerminateTimeout):
-		//times up mr. process, we did ask nicely!
+		// times up mr. process, we did ask nicely!
 		mp.debugf("graceful timeout, forcing exit")
 		mp.sendSignal(os.Kill)
 	}
 }
 
-//not a real fork
+// not a real fork
 func (mp *master) forkLoop() error {
-	//loop, restart command
+	// loop, restart command
 	for {
 		if err := mp.fork(); err != nil {
 			return err
@@ -344,68 +327,74 @@ func (mp *master) forkLoop() error {
 func (mp *master) fork() error {
 	mp.debugf("starting %s", mp.binPath)
 	cmd := exec.Command(mp.binPath)
-	//mark this new process as the "active" slave process.
-	//this process is assumed to be holding the socket files.
+
+	// mark this new process as the "active" slave process.
+	// this process is assumed to be holding the socket files.
 	mp.slaveCmd = cmd
 	mp.slaveID++
-	//provide the slave process with some state
-	e := os.Environ()
-	e = append(e, envBinID+"="+hex.EncodeToString(mp.binHash))
-	e = append(e, envBinPath+"="+mp.binPath)
-	e = append(e, envSlaveID+"="+strconv.Itoa(mp.slaveID))
-	e = append(e, envIsSlave+"=1")
-	e = append(e, envNumFDs+"="+strconv.Itoa(len(mp.slaveExtraFiles)))
-	cmd.Env = e
-	//inherit master args/stdfiles
+
+	// provide the slave process with some state
+	cmd.Env = mp.retrieveSlaveEnviron()
+
+	// inherit master args and std files
 	cmd.Args = os.Args
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	//include socket files
-	cmd.ExtraFiles = mp.slaveExtraFiles
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("Failed to start slave process: %s", err)
+
+	// include socket files
+	// Windows doesn't support ExtraFiles, Windows version uses named pipes instead
+	if runtime.GOOS != "windows" {
+		cmd.ExtraFiles = mp.slaveExtraFiles
 	}
-	//was scheduled to restart, notify success
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start slave process: %s", err)
+	}
+	// was scheduled to restart, notify success
 	if mp.restarting {
 		mp.restartedAt = time.Now()
 		mp.restarting = false
 		mp.restarted <- true
 	}
-	//convert wait into channel
-	cmdwait := make(chan error)
+
+	// convert wait into channel
+	cmdWait := make(chan error)
 	go func() {
-		cmdwait <- cmd.Wait()
+		cmdWait <- cmd.Wait()
 	}()
-	//wait....
+
+	// wait....
 	select {
-	case err := <-cmdwait:
-		//program exited before releasing descriptors
-		//proxy exit code out to master
+	case err := <-cmdWait:
+		// program exited before releasing descriptors proxy exit code out to master
 		code := 0
 		if err != nil {
 			code = 1
-			if exiterr, ok := err.(*exec.ExitError); ok {
-				if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 					code = status.ExitStatus()
+					mp.debugf("prog exited with status: %d, error: %v", code, exitErr)
+				} else {
+					mp.debugf("prog exited with status: %d, but could not get syscall.WaitStatus", code)
 				}
+			} else {
+				mp.debugf("prog exited with error (not ExitError): %v", err)
 			}
 		}
 		mp.debugf("prog exited with %d", code)
-		//if a restarts are disabled or if it was an
-		//unexpected crash, proxy this exit straight
-		//through to the main process
+		// if a restarts are disabled or if it was an unexpected crash,
+		// proxy this exit straight through to the main process
 		if mp.NoRestart || !mp.restarting {
+			mp.debugf("shutdown: NoRestart=%v, restarting=%v, proceeding with exit(%d)", mp.NoRestart, mp.restarting, code)
 			os.Exit(code)
 		}
 	case <-mp.descriptorsReleased:
-		//if descriptors are released, the program
-		//has yielded control of its sockets and
-		//a parallel instance of the program can be
-		//started safely. it should serve state.Listeners
-		//to ensure downtime is kept at <1sec. The previous
-		//cmd.Wait() will still be consumed though the
-		//result will be discarded.
+		// if descriptors are released, the program has yielded control of its sockets and a parallel instance of
+		// the program can be started safely. it should serve state.Listeners to ensure downtime is kept at <1sec.
+		// The previous cmd.Wait() will still be consumed though the result will be discarded.
+		mp.debugf("descriptors released, starting new process")
 	}
 	return nil
 }

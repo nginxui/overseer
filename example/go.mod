@@ -1,6 +1,8 @@
 module eg
 
-go 1.13
+go 1.21
+
+toolchain go1.23.2
 
 replace github.com/jpillora/overseer => ../
 
