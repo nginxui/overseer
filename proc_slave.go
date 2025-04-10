@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"time"
 )
@@ -84,6 +85,13 @@ func (sp *slave) initFileDescriptors() error {
 	if err != nil {
 		return fmt.Errorf("invalid %s integer", envNumFDs)
 	}
+	
+	// On Windows, we create listeners directly instead of using file descriptors
+	if runtime.GOOS == "windows" {
+		return sp.initWindowsListeners()
+	}
+	
+	// POSIX file descriptor handling
 	sp.listeners = make([]*overseerListener, numFDs)
 	sp.state.Listeners = make([]net.Listener, numFDs)
 	for i := 0; i < numFDs; i++ {
@@ -99,6 +107,35 @@ func (sp *slave) initFileDescriptors() error {
 	if len(sp.state.Listeners) > 0 {
 		sp.state.Listener = sp.state.Listeners[0]
 	}
+	return nil
+}
+
+// initWindowsListeners creates listeners directly on Windows instead of using file descriptors
+func (sp *slave) initWindowsListeners() error {
+	sp.listeners = make([]*overseerListener, len(sp.Config.Addresses))
+	sp.state.Listeners = make([]net.Listener, len(sp.Config.Addresses))
+	
+	for i, addr := range sp.Config.Addresses {
+		a, err := net.ResolveTCPAddr("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("Invalid address %s (%s)", addr, err)
+		}
+		
+		// Try to listen on the address
+		l, err := net.ListenTCP("tcp", a)
+		if err != nil {
+			return fmt.Errorf("Failed to listen on: %s (%s)", addr, err)
+		}
+		
+		u := newOverseerListener(l)
+		sp.listeners[i] = u
+		sp.state.Listeners[i] = u
+	}
+	
+	if len(sp.state.Listeners) > 0 {
+		sp.state.Listener = sp.state.Listeners[0]
+	}
+	
 	return nil
 }
 
@@ -121,7 +158,15 @@ func (sp *slave) watchSignal() {
 			//a new process before this child has actually exited.
 			//early restarts not supported with restarts disabled.
 			if !sp.NoRestart {
-				sp.masterProc.Signal(SIGUSR1)
+				// On Windows, we need to handle SIGUSR1 differently
+				if runtime.GOOS == "windows" {
+					// On Windows, use a different approach to signal the master
+					// Simply create a temporary file that the master can detect
+					sp.debugf("windows: signaling master that sockets are released")
+					sp.descriptorsReleased()
+				} else {
+					sp.masterProc.Signal(SIGUSR1)
+				}
 			}
 			//listeners should be waiting on connections to close...
 		}
@@ -132,6 +177,24 @@ func (sp *slave) watchSignal() {
 			os.Exit(1)
 		}()
 	}()
+}
+
+// descriptorsReleased is a Windows-specific function to inform the master process
+// that socket descriptors are released
+func (sp *slave) descriptorsReleased() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	
+	// On Windows, we can't use signals the same way as on POSIX systems
+	// So we'll create a temporary file to indicate the sockets are released
+	tempFile := os.TempDir() + "/overseer-" + sp.id + "-released"
+	f, err := os.Create(tempFile)
+	if err != nil {
+		sp.warnf("failed to create release file: %s", err)
+		return
+	}
+	f.Close()
 }
 
 func (sp *slave) triggerRestart() {

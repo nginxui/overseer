@@ -112,6 +112,12 @@ func (mp *master) setupSignalling() {
 			mp.handleSignal(s)
 		}
 	}()
+	
+	// On Windows, we need to periodically check for the temporary file
+	// that indicates the slave has released its sockets
+	if runtime.GOOS == "windows" {
+		go mp.checkSocketsReleasedOnWindows()
+	}
 }
 
 func (mp *master) handleSignal(s os.Signal) {
@@ -155,6 +161,15 @@ func (mp *master) sendSignal(s os.Signal) {
 
 func (mp *master) retreiveFileDescriptors() error {
 	mp.slaveExtraFiles = make([]*os.File, len(mp.Config.Addresses))
+	
+	// On Windows, we don't use file descriptors as they are not supported for TCP sockets
+	if runtime.GOOS == "windows" {
+		// Instead of using file descriptors, we'll save the addresses
+		// and let the slave process recreate the listeners
+		return nil
+	}
+	
+	// POSIX implementation (unchanged)
 	for i, addr := range mp.Config.Addresses {
 		a, err := net.ResolveTCPAddr("tcp", addr)
 		if err != nil {
@@ -354,15 +369,24 @@ func (mp *master) fork() error {
 	e = append(e, envBinPath+"="+mp.binPath)
 	e = append(e, envSlaveID+"="+strconv.Itoa(mp.slaveID))
 	e = append(e, envIsSlave+"=1")
-	e = append(e, envNumFDs+"="+strconv.Itoa(len(mp.slaveExtraFiles)))
+	
+	// Windows does not support passing file descriptors between processes
+	// So we'll pass 0 and use addresses directly in slave
+	if runtime.GOOS == "windows" {
+		e = append(e, envNumFDs+"=0")
+	} else {
+		e = append(e, envNumFDs+"="+strconv.Itoa(len(mp.slaveExtraFiles)))
+		//include socket files for non-Windows platforms
+		cmd.ExtraFiles = mp.slaveExtraFiles
+	}
+	
 	cmd.Env = e
 	//inherit master args/stdfiles
 	cmd.Args = os.Args
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	//include socket files
-	cmd.ExtraFiles = mp.slaveExtraFiles
+	
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("Failed to start slave process: %s", err)
 	}
@@ -435,4 +459,34 @@ func extension() string {
 	}
 
 	return ""
+}
+
+// checkSocketsReleasedOnWindows is a Windows-specific function that periodically
+// checks if the slave process has created a file indicating it has released its sockets
+func (mp *master) checkSocketsReleasedOnWindows() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	
+	for {
+		// Only check when we're actually waiting for a release
+		if !mp.awaitingUSR1 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		
+		// Check for the release file
+		tempFile := os.TempDir() + "/overseer-" + strconv.Itoa(mp.slaveID) + "-released"
+		if _, err := os.Stat(tempFile); err == nil {
+			// File exists, slave has released sockets
+			mp.debugf("windows: detected socket release via file")
+			mp.awaitingUSR1 = false
+			mp.descriptorsReleased <- true
+			
+			// Clean up the file
+			os.Remove(tempFile)
+		}
+		
+		time.Sleep(100 * time.Millisecond)
+	}
 }
