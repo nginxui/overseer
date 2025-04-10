@@ -1,9 +1,16 @@
 module github.com/jpillora/overseer
 
-go 1.13
+go 1.23.0
+
+toolchain go1.23.2
 
 require (
-	github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d
-	github.com/go-ole/go-ole v1.2.4 // indirect
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/jpillora/s3 v1.1.4
+	github.com/yusufpapurcu/wmi v1.2.4
+)
+
+require (
+	github.com/go-ole/go-ole v1.2.6 // indirect
+	golang.org/x/sys v0.10.0 // indirect
 )
