@@ -9,3 +9,8 @@ require (
 	github.com/jpillora/s3 v1.1.4
 	github.com/yusufpapurcu/wmi v1.2.4
 )
+
+require (
+	github.com/go-ole/go-ole v1.2.6 // indirect
+	golang.org/x/sys v0.10.0 // indirect
+)
