@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/Microsoft/go-winio"
 )
 
 var tmpBinPath = filepath.Join(os.TempDir(), "overseer-"+token()+extension())
@@ -461,8 +463,8 @@ func extension() string {
 	return ""
 }
 
-// checkSocketsReleasedOnWindows is a Windows-specific function that periodically
-// checks if the slave process has created a file indicating it has released its sockets
+// checkSocketsReleasedOnWindows is a Windows-specific function that waits for 
+// the slave process to signal via named pipe that it has released its sockets
 func (mp *master) checkSocketsReleasedOnWindows() {
 	if runtime.GOOS != "windows" {
 		return
@@ -475,18 +477,43 @@ func (mp *master) checkSocketsReleasedOnWindows() {
 			continue
 		}
 		
-		// Check for the release file
-		tempFile := os.TempDir() + "/overseer-" + strconv.Itoa(mp.slaveID) + "-released"
-		if _, err := os.Stat(tempFile); err == nil {
-			// File exists, slave has released sockets
-			mp.debugf("windows: detected socket release via file")
-			mp.awaitingUSR1 = false
-			mp.descriptorsReleased <- true
-			
-			// Clean up the file
-			os.Remove(tempFile)
+		// Create a named pipe to wait for slave's signal
+		pipeName := fmt.Sprintf(`\\.\pipe\overseer-release-%d`, mp.slaveID)
+		mp.debugf("windows: listening for release signal on pipe %s", pipeName)
+		
+		// Set up the pipe server with security descriptor allowing access to everyone
+		pc := &winio.PipeConfig{
+			SecurityDescriptor: "D:P(A;;GA;;;AU)",
+			MessageMode:        true,
+			InputBufferSize:    1024,
+			OutputBufferSize:   1024,
 		}
 		
-		time.Sleep(100 * time.Millisecond)
+		listener, err := winio.ListenPipe(pipeName, pc)
+		if err != nil {
+			mp.warnf("windows: failed to create pipe: %s", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		
+		// Accept connection from slave
+		conn, err := listener.Accept()
+		if err != nil {
+			listener.Close()
+			mp.warnf("windows: pipe accept error: %s", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		
+		// Read message (don't really need the content)
+		buf := make([]byte, 1024)
+		_, err = conn.Read(buf)
+		conn.Close()
+		listener.Close()
+		
+		// Received signal from slave
+		mp.debugf("windows: received socket release signal via pipe")
+		mp.awaitingUSR1 = false
+		mp.descriptorsReleased <- true
 	}
 }

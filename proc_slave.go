@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/Microsoft/go-winio"
 )
 
 var (
@@ -180,21 +182,44 @@ func (sp *slave) watchSignal() {
 }
 
 // descriptorsReleased is a Windows-specific function to inform the master process
-// that socket descriptors are released
+// that socket descriptors are released using a named pipe
 func (sp *slave) descriptorsReleased() {
 	if runtime.GOOS != "windows" {
 		return
 	}
 	
-	// On Windows, we can't use signals the same way as on POSIX systems
-	// So we'll create a temporary file to indicate the sockets are released
-	tempFile := os.TempDir() + "/overseer-" + sp.id + "-released"
-	f, err := os.Create(tempFile)
+	// Create the pipe name that master is listening on
+	pipeName := fmt.Sprintf(`\\.\pipe\overseer-release-%s`, sp.id)
+	sp.debugf("windows: signaling socket release via pipe %s", pipeName)
+	
+	// Try to connect a few times with backoff
+	var err error
+	var conn net.Conn
+	
+	for attempts := 0; attempts < 5; attempts++ {
+		// Connect to the named pipe
+		conn, err = winio.DialPipe(pipeName, nil)
+		if err == nil {
+			break
+		}
+		sp.debugf("windows: pipe connection attempt %d failed: %s", attempts+1, err)
+		time.Sleep(time.Duration(attempts+1) * 200 * time.Millisecond)
+	}
+	
 	if err != nil {
-		sp.warnf("failed to create release file: %s", err)
+		sp.warnf("windows: failed to connect to master pipe: %s", err)
 		return
 	}
-	f.Close()
+	
+	// Send a simple message
+	_, err = conn.Write([]byte("released"))
+	if err != nil {
+		sp.warnf("windows: failed to write to pipe: %s", err)
+	}
+	
+	// Close the connection
+	conn.Close()
+	sp.debugf("windows: socket release signal sent via pipe")
 }
 
 func (sp *slave) triggerRestart() {
